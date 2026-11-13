@@ -1,4 +1,4 @@
-// Qui a dit ça ? — party game multijoueur (anecdotes, "qui est le plus…", oui/non)
+// KIADISSA — party game multijoueur (anecdotes, "qui est le plus…", oui/non)
 // Serveur Node.js sans aucune dépendance : http + Server-Sent Events.
 // Lancer : node server.js   (puis ouvrir http://localhost:3000)
 
@@ -597,4 +597,4 @@ setInterval(() => {
   }
 }, 15000);
 
-server.listen(PORT, () => console.log(`🎉 Qui a dit ça ? -> http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`🎉 KIADISSA -> http://localhost:${PORT}`));

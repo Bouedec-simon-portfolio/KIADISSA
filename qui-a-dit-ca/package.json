@@ -1,5 +1,5 @@
 {
-  "name": "qui-a-dit-ca",
+  "name": "kiadissa",
   "version": "1.0.0",
   "description": "Party game multijoueur entre potes : anecdotes, qui est le plus..., oui/non",
   "main": "server.js",

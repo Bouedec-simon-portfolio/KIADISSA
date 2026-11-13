@@ -1,4 +1,4 @@
-# 🎉 Qui a dit ça ?
+# 🎉 KIADISSA
 
 Party game multijoueur en ligne entre potes (3 à 12 joueurs), inspiré des soirées TeamSpeak de Gotaga.
 Chaque joueur rejoint depuis son navigateur (PC ou téléphone) avec un **code de salle**, sans compte ni installation.
@@ -33,23 +33,16 @@ Ouvre ensuite http://localhost:3000. Pour tester seul, ouvre plusieurs fenêtres
 
 ## 🌍 Mettre en ligne gratuitement (Render)
 
-1. Crée un dépôt GitHub (ex. `qui-a-dit-ca`) et envoies-y le contenu de ce dossier :
-   ```bash
-   git init
-   git add .
-   git commit -m "Qui a dit ça ?"
-   git branch -M main
-   git remote add origin https://github.com/<ton-pseudo>/qui-a-dit-ca.git
-   git push -u origin main
-   ```
+1. Mets ce projet sur GitHub (ici : le dépôt `KIADISSA`, avec le jeu dans le dossier `qui-a-dit-ca/`).
 2. Va sur https://render.com et connecte-toi avec GitHub.
 3. Clique sur **New → Web Service** et choisis ton dépôt.
 4. Réglages :
    - **Runtime** : Node
    - **Build Command** : *(laisse vide)* ou `echo ok`
+   - **Root Directory** : `qui-a-dit-ca` (le dossier qui contient `server.js`)
    - **Start Command** : `node server.js`
    - **Instance type** : Free
-5. Clique sur **Deploy**. Au bout d'une minute environ, tu as une URL du genre `https://qui-a-dit-ca.onrender.com` à envoyer à tes potes.
+5. Clique sur **Deploy**. Au bout d'une minute environ, tu as une URL du genre `https://kiadissa.onrender.com` à envoyer à tes potes.
 
 > ℹ️ Avec l'offre gratuite, le serveur s'endort après environ 15 min sans visite. La première ouverture prend alors 30 à 60 secondes : ouvre le site un peu avant de jouer.
 > Les parties sont gardées en mémoire, donc un redémarrage du serveur efface les salles en cours.
