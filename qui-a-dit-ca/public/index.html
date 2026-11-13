@@ -110,6 +110,12 @@
   .podium .pr.first { background: linear-gradient(90deg, #b8860b, #3b479d 70%); }
   .podium .rank { font-family: var(--pixel); font-size: 22px; width: 34px; }
   .podium .pts { margin-left: auto; font-family: var(--pixel); font-size: 20px; }
+  body.hot { background: radial-gradient(ellipse at top, #c2416b, #6a1f5c 70%) fixed; }
+  body.hot .panel { background: color-mix(in srgb, #4a1640 85%, transparent); border-color: rgba(255,140,170,.5); }
+  .hot-chip { background: #ff4d6d; color: #fff; }
+  body.hot input.field, body.hot textarea.field, body.hot select.field, body.hot .anec-card, body.hot .reveal-card, body.hot .bars { background: #5c1d4f; border-color: #ff8fab; }
+  body.hot .lobby-players .lp, body.hot .players-pick button, body.hot .podium .pr, body.hot .pick-grid button { background: #6e2860; }
+  body.hot .players-pick button:hover:not(:disabled) { background: #85306f; }
   .fade-in { animation: fade .35s ease; }
   main.panel:not(.fade-in) .fade-in { animation: none; }
   @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -203,6 +209,7 @@ function leave(msg) {
   if (es) es.close();
   es = null; S = null; session = null; screenKey = "";
   localStorage.removeItem("qadc_session");
+  document.body.classList.remove("hot");
   history.replaceState(null, "", "/");
   renderHome();
   if (msg) toast(msg);
@@ -311,7 +318,9 @@ function header() {
   const t = timerBar();
   return h("div", {},
     h("div", { class: "topbar" },
-      h("span", { class: "chip" }, `Manche ${S.roundNum}/${S.totalRounds} · ${TYPE_LABEL[S.round.type]}`),
+      h("div", { class: "row", style: "gap:6px" },
+        h("span", { class: "chip" }, `Manche ${S.roundNum}/${S.totalRounds} · ${TYPE_LABEL[S.round.type]}`),
+        S.round.hot ? h("span", { class: "chip hot-chip" }, "🔥 HOT") : null),
       h("div", { class: "row" },
         S.deadline ? t.label : null,
         isHost() && ["write", "guess", "vote"].includes(S.phase) ? h("button", { class: "btn ghost small", onclick: () => act("skip") }, "Passer ⏭") : null
@@ -324,6 +333,7 @@ function header() {
 // ================== rendu principal ==================
 function render() {
   if (!S) return;
+  document.body.classList.toggle("hot", S.phase === "lobby" || S.phase === "end" ? S.settings.mode === "hot" : !!S.round?.hot);
   const key = [S.phase, S.roundNum, S.anecdote?.index ?? ""].join("|");
   const sameScreen = key === screenKey;
   screenKey = key;
@@ -384,7 +394,15 @@ function lobbyScreen(main) {
     ta.addEventListener("change", pushSettings);
     return h("label", {}, label, ta);
   };
+  const modeSel = h("select", { class: "field", disabled: !isHost(), "data-k": "mode" },
+    h("option", { value: "normal" }, "😇 Normal"),
+    h("option", { value: "mix" }, "😏 Mix normal + hot"),
+    h("option", { value: "hot" }, "🔥 Hot / Hardcore (18+)")
+  );
+  modeSel.value = st.mode || "normal";
+  modeSel.addEventListener("change", pushSettings);
   const settingsBox = h("div", { class: "settings" },
+    h("label", {}, "Mode de jeu", modeSel),
     num("anecdoteRounds", "Manches anecdotes", 0, 10),
     num("quiRounds", "Manches « qui est le plus »", 0, 15),
     num("ouinonRounds", "Manches oui / non", 0, 15),
@@ -410,7 +428,10 @@ function lobbyScreen(main) {
   const startBtn = h("button", { class: "btn", style: "font-size:22px;padding:14px 34px" }, "Lancer la partie");
   startBtn.onclick = () => act("start");
   const hostInfo = h("div", { class: "center muted" });
+  const hotWarn = h("p", { class: "center", style: "color:#ffb3c1;margin:8px 0 0" }, "🔥 Questions trash pour adultes : à faire entre potes qui assument !");
   live.hostBits = () => {
+    document.body.classList.toggle("hot", S.settings.mode === "hot");
+    hotWarn.hidden = S.settings.mode === "normal";
     const n = S.players.filter((p) => p.connected).length;
     startBtn.hidden = !isHost();
     startBtn.disabled = n < S.minPlayers;
@@ -434,7 +455,7 @@ function lobbyScreen(main) {
     ),
     countLabel,
     playersBox,
-    h("div", { style: "margin-top:20px" }, h("div", { class: "label", style: "margin-bottom:8px" }, "Réglages"), settingsBox, customBox),
+    h("div", { style: "margin-top:20px" }, h("div", { class: "label", style: "margin-bottom:8px" }, "Réglages"), settingsBox, hotWarn, customBox),
     h("div", { class: "row center", style: "margin-top:20px;flex-direction:column" }, startBtn, hostInfo)
   );
   live.hostBits();

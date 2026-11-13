@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS = {
   writeTime: 90,
   guessTime: 25,
   voteTime: 25,
+  mode: "normal", // "normal" | "hot" | "mix"
   custom: { anecdote: [], qui: [], ouinon: [] },
 };
 
@@ -73,11 +74,19 @@ const connected = (room) => [...room.players.values()].filter((p) => p.clients.s
 
 // ---------- construction de la partie ----------
 function pickQuestions(type, count, room) {
-  const custom = shuffle(room.settings.custom[type] || []);
-  const base = shuffle(QUESTIONS[type].filter((q) => !room.usedQuestions.has(q)));
-  const pool = [...custom, ...base];
-  const picked = pool.slice(0, count);
-  picked.forEach((q) => room.usedQuestions.add(q));
+  const mode = room.settings.mode;
+  const custom = shuffle(room.settings.custom[type] || []).map((q) => ({ q, hot: mode === "hot" }));
+  let base = [];
+  if (mode !== "hot") base.push(...QUESTIONS[type].map((q) => ({ q, hot: false })));
+  if (mode !== "normal") base.push(...QUESTIONS.hot[type].map((q) => ({ q, hot: true })));
+  let fresh = base.filter((x) => !room.usedQuestions.has(x.q));
+  // banque épuisée : on recommence à zéro
+  if (fresh.length < count) {
+    base.forEach((x) => room.usedQuestions.delete(x.q));
+    fresh = base;
+  }
+  const picked = [...custom, ...shuffle(fresh)].slice(0, count);
+  picked.forEach((x) => room.usedQuestions.add(x.q));
   return picked;
 }
 
@@ -96,7 +105,8 @@ function buildRounds(room) {
     added = false;
     for (const t of order) {
       if (lists[t].length) {
-        rounds.push({ type: t, question: lists[t].shift() });
+        const { q, hot } = lists[t].shift();
+        rounds.push({ type: t, question: q, hot });
         added = true;
       }
     }
@@ -254,6 +264,7 @@ function handleAction(room, player, body) {
         writeTime: clampInt(s.writeTime, 20, 300, room.settings.writeTime),
         guessTime: clampInt(s.guessTime, 10, 120, room.settings.guessTime),
         voteTime: clampInt(s.voteTime, 10, 120, room.settings.voteTime),
+        mode: ["normal", "hot", "mix"].includes(s.mode) ? s.mode : room.settings.mode,
         custom: s.custom
           ? { anecdote: splitLines(s.custom.anecdote), qui: splitLines(s.custom.qui), ouinon: splitLines(s.custom.ouinon) }
           : room.settings.custom,
@@ -362,7 +373,7 @@ function viewFor(room, me) {
     now: Date.now(),
     roundNum: room.roundIndex + 1,
     totalRounds: room.rounds?.length || 0,
-    round: round ? { type: round.type, question: round.question } : null,
+    round: round ? { type: round.type, question: round.question, hot: !!round.hot } : null,
     minPlayers: MIN_PLAYERS,
     maxAnecdote: MAX_ANECDOTE,
   };
