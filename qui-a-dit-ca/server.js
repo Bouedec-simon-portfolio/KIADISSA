@@ -1,4 +1,4 @@
-// KIADISSA — party game multijoueur (anecdotes, "qui est le plus…", oui/non)
+// KIADISSA — party game multijoueur entre potes
 // Serveur Node.js sans aucune dépendance : http + Server-Sent Events.
 // Lancer : node server.js   (puis ouvrir http://localhost:3000)
 
@@ -6,25 +6,31 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
-const QUESTIONS = require("./questions");
+const { packs: PACKS, gages: GAGES } = require("./questions");
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, "public");
 
 const MAX_PLAYERS = 12;
+const MAX_SPECTATORS = 20;
 const MIN_PLAYERS = 3;
-const MAX_ANECDOTE = 280;
-const REVEAL_PAUSE = 1500; // petite pause quand tout le monde a répondu
+const MAX_TEXT = 280;
+const MAX_STATEMENT = 140;
+const DONE_PAUSE = 1500; // petite pause quand tout le monde a répondu
+const MAX_PHOTO = 60000; // taille max d'une photo (dataURL)
+
+const TYPES = ["anecdote", "menteur", "qui", "ouinon", "tuprefs", "phrase", "jamais", "connais"];
+const ORDER = ["anecdote", "qui", "tuprefs", "ouinon", "menteur", "jamais", "phrase", "connais"];
+const REACTIONS = ["😂", "💀", "🔥", "👀", "😱", "🤡", "❤️", "👏"];
 
 const DEFAULT_SETTINGS = {
-  anecdoteRounds: 2,
-  quiRounds: 3,
-  ouinonRounds: 3,
+  rounds: { anecdote: 1, menteur: 1, qui: 2, ouinon: 2, tuprefs: 1, phrase: 1, jamais: 1, connais: 1 },
   writeTime: 90,
   guessTime: 25,
   voteTime: 25,
-  mode: "normal", // "normal" | "hot" | "mix"
-  custom: { anecdote: [], qui: [], ouinon: [] },
+  packs: ["normal"],
+  gages: true,
+  custom: { anecdote: [], qui: [], ouinon: [], tuprefs: [], phrase: [], jamais: [] },
 };
 
 const AVATARS = ["🦊", "🐸", "🐼", "🐙", "🦄", "🐲", "👽", "🤖", "👻", "🐵", "🦁", "🐧", "🍕", "🌵", "💀", "🤡", "🐱", "🐶", "🦖", "🐝"];
@@ -43,6 +49,7 @@ const shuffle = (arr) => {
   }
   return a;
 };
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 const clampInt = (v, min, max, def) => {
   const n = parseInt(v, 10);
   return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : def;
@@ -52,61 +59,82 @@ const cleanText = (s, max) => String(s ?? "").replace(/[\u0000-\u0008\u000B-\u00
 function newRoomCode() {
   const letters = "ABCDEFGHJKLMNPQRSTUVWXYZ";
   let code;
-  do {
-    code = Array.from({ length: 4 }, () => letters[Math.floor(Math.random() * letters.length)]).join("");
-  } while (rooms.has(code));
+  do code = Array.from({ length: 4 }, () => pick(letters)).join("");
+  while (rooms.has(code));
   return code;
 }
 
-function makePlayer(name, avatar, color) {
+function parsePhoto(dataUrl) {
+  const m = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(String(dataUrl || ""));
+  if (!m || dataUrl.length > MAX_PHOTO) return null;
+  return { type: "image/" + m[1], buf: Buffer.from(m[2], "base64") };
+}
+
+function makePlayer(b) {
   return {
     id: rid(),
-    name: cleanText(name, 16) || "Joueur",
-    avatar: AVATARS.includes(avatar) ? avatar : AVATARS[Math.floor(Math.random() * AVATARS.length)],
-    color: COLORS.includes(color) ? color : COLORS[Math.floor(Math.random() * COLORS.length)],
+    name: cleanText(b.name, 16) || "Joueur",
+    avatar: AVATARS.includes(b.avatar) ? b.avatar : pick(AVATARS),
+    color: COLORS.includes(b.color) ? b.color : pick(COLORS),
+    photo: parsePhoto(b.photo),
+    photoV: Date.now().toString(36),
     score: 0,
+    stats: {},
+    jokerUsed: false,
+    reacts: [],
     clients: new Set(),
     joinedAt: Date.now(),
   };
 }
 
 const connected = (room) => [...room.players.values()].filter((p) => p.clients.size > 0);
+const stat = (p, key, n = 1) => p && (p.stats[key] = (p.stats[key] || 0) + n);
+const addScore = (room, pid, n) => {
+  const p = room.players.get(pid);
+  if (!p) return;
+  p.score += n;
+  room.r.points[pid] = (room.r.points[pid] || 0) + n;
+};
+const nameOf = (room, pid) => room.players.get(pid)?.name || "un joueur parti";
 
-// ---------- construction de la partie ----------
-function pickQuestions(type, count, room) {
-  const mode = room.settings.mode;
-  const custom = shuffle(room.settings.custom[type] || []).map((q) => ({ q, hot: mode === "hot" }));
+// ---------- choix des questions ----------
+const poolKey = (type) => (type === "connais" ? "tuprefs" : type);
+
+function pickQuestions(room, type, count) {
+  if (type === "menteur") return Array.from({ length: count }, () => ({ q: "2 vérités, 1 mensonge", hot: false }));
+  const key = poolKey(type);
+  const selected = room.settings.packs.filter((p) => PACKS[p]);
+  const hotOnly = selected.length > 0 && selected.every((p) => PACKS[p].hot);
+  let custom = (room.settings.custom[key] || []).map((q) => ({ q, hot: hotOnly }));
+  if (key === "tuprefs") custom = custom.map((x) => ({ ...x, q: x.q.split("|").map((s) => s.trim()) })).filter((x) => x.q.length >= 2 && x.q[0] && x.q[1]);
   let base = [];
-  if (mode !== "hot") base.push(...QUESTIONS[type].map((q) => ({ q, hot: false })));
-  if (mode !== "normal") base.push(...QUESTIONS.hot[type].map((q) => ({ q, hot: true })));
-  let fresh = base.filter((x) => !room.usedQuestions.has(x.q));
-  // banque épuisée : on recommence à zéro
+  for (const p of selected) base.push(...(PACKS[p][key] || []).map((q) => ({ q, hot: !!PACKS[p].hot })));
+  if (!base.length) base = PACKS.normal[key].map((q) => ({ q, hot: false }));
+  const k = (x) => key + ":" + JSON.stringify(x.q);
+  let fresh = base.filter((x) => !room.used.has(k(x)));
   if (fresh.length < count) {
-    base.forEach((x) => room.usedQuestions.delete(x.q));
+    base.forEach((x) => room.used.delete(k(x)));
     fresh = base;
   }
-  const picked = [...custom, ...shuffle(fresh)].slice(0, count);
-  picked.forEach((x) => room.usedQuestions.add(x.q));
-  return picked;
+  const out = [...shuffle(custom).filter((x) => !room.used.has(k(x))), ...shuffle(fresh)].slice(0, count);
+  out.forEach((x) => room.used.add(k(x)));
+  return out;
 }
 
 function buildRounds(room) {
-  const s = room.settings;
-  const lists = {
-    anecdote: pickQuestions("anecdote", s.anecdoteRounds, room),
-    qui: pickQuestions("qui", s.quiRounds, room),
-    ouinon: pickQuestions("ouinon", s.ouinonRounds, room),
-  };
-  // On alterne les types : anecdote, qui, ouinon, anecdote, ...
+  const lists = {};
+  for (const t of TYPES) lists[t] = pickQuestions(room, t, room.settings.rounds[t] || 0);
   const rounds = [];
-  const order = ["anecdote", "qui", "ouinon"];
   let added = true;
   while (added) {
     added = false;
-    for (const t of order) {
+    for (const t of ORDER) {
       if (lists[t].length) {
         const { q, hot } = lists[t].shift();
-        rounds.push({ type: t, question: q, hot });
+        const round = { type: t, hot };
+        if (t === "tuprefs" || t === "connais") round.opts = q;
+        else round.question = q;
+        rounds.push(round);
         added = true;
       }
     }
@@ -123,151 +151,295 @@ function clearTimer(room) {
 function setPhase(room, phase, seconds, onEnd) {
   clearTimer(room);
   room.phase = phase;
+  room.phaseId = rid();
   room.deadline = seconds ? Date.now() + seconds * 1000 : null;
   room.duration = seconds || 0;
-  if (seconds && onEnd) room.timer = setTimeout(() => onEnd(room), seconds * 1000);
+  if (seconds && onEnd) {
+    const id = room.phaseId;
+    room.timer = setTimeout(() => room.phaseId === id && onEnd(room), seconds * 1000);
+  }
   broadcast(room);
 }
 
 function startGame(room) {
   room.rounds = buildRounds(room);
   if (!room.rounds.length) return;
-  for (const p of room.players.values()) p.score = 0;
+  for (const p of room.players.values()) {
+    p.score = 0;
+    p.stats = {};
+    p.jokerUsed = false;
+  }
   room.history = [];
+  room.recap = [];
+  room.gage = null;
+  room.connaisDone = new Set();
   room.roundIndex = -1;
   nextRound(room);
 }
 
 function nextRound(room) {
   room.roundIndex++;
-  if (room.roundIndex >= room.rounds.length) {
-    setPhase(room, "end");
-    return;
-  }
+  if (room.roundIndex >= room.rounds.length) return endGame(room);
   const round = room.rounds[room.roundIndex];
-  room.votes = new Map();
-  room.anecdotes = [];
-  room.guessIndex = 0;
-  room.roundPoints = new Map();
-  if (round.type === "anecdote") {
-    room.submissions = new Map();
-    setPhase(room, "write", room.settings.writeTime, endWrite);
-  } else {
-    setPhase(room, "vote", room.settings.voteTime, endVote);
+  const s = room.settings;
+  room.r = { ...round, subs: new Map(), items: [], idx: 0, votes: new Map(), preds: new Map(), points: {}, reveal: null };
+
+  switch (round.type) {
+    case "anecdote":
+    case "phrase":
+      return setPhase(room, "write", s.writeTime, endWrite);
+    case "menteur":
+      room.r.question = "2 vérités, 1 mensonge";
+      return setPhase(room, "write", Math.round(s.writeTime * 1.5), endWrite);
+    case "tuprefs":
+      room.r.question = "Tu préfères…";
+      return setPhase(room, "vote", s.voteTime, endVote);
+    case "connais": {
+      const cands = connected(room).filter((p) => !room.connaisDone.has(p.id));
+      const target = pick(cands.length ? cands : connected(room));
+      if (!target) return nextRound(room);
+      room.connaisDone.add(target.id);
+      room.r.target = target.id;
+      room.r.question = `Qui connaît le mieux ${target.name} ?`;
+      return setPhase(room, "vote", s.voteTime, endVote);
+    }
+    default:
+      return setPhase(room, "vote", s.voteTime, endVote);
   }
 }
 
-// --- anecdotes ---
+// --- fin de la phase d'écriture ---
 function endWrite(room) {
-  if (room.phase !== "write") return;
-  room.anecdotes = shuffle(
-    [...room.submissions.entries()]
-      .filter(([pid, text]) => text && room.players.has(pid))
-      .map(([pid, text]) => ({ id: rid(), author: pid, text, votes: new Map() }))
-  );
-  if (room.anecdotes.length === 0) {
-    room.history.push({ type: "anecdote", question: currentRound(room).question, empty: true });
-    setPhase(room, "anecReveal");
-    return;
+  const r = room.r;
+  const subs = [...r.subs.entries()].filter(([pid]) => room.players.has(pid));
+  if (r.type === "phrase") {
+    r.items = shuffle(subs.map(([pid, text]) => ({ id: rid(), author: pid, text })));
+    if (r.items.length < 2) return finishRound(room);
+    return setPhase(room, "vote", room.settings.voteTime + 10, endVote);
   }
-  room.guessIndex = 0;
+  r.items = shuffle(
+    subs.map(([pid, sub]) => {
+      const item = { id: rid(), author: pid, votes: new Map() };
+      if (r.type === "anecdote") item.text = sub;
+      else {
+        // menteur : on mélange l'ordre des 3 phrases
+        const order = shuffle([0, 1, 2]);
+        item.statements = order.map((i) => sub.s[i]);
+        item.lie = order.indexOf(sub.lie);
+      }
+      return item;
+    })
+  );
+  if (!r.items.length) return finishRound(room);
+  r.idx = 0;
   setPhase(room, "guess", room.settings.guessTime, endGuess);
 }
 
 function endGuess(room) {
-  if (room.phase !== "guess") return;
-  room.guessIndex++;
-  if (room.guessIndex < room.anecdotes.length) {
-    setPhase(room, "guess", room.settings.guessTime, endGuess);
-    return;
-  }
-  // Résultats : +1 par bonne réponse, +1 à l'auteur pour chaque joueur trompé
-  for (const a of room.anecdotes) {
-    for (const [voter, target] of a.votes) {
-      const v = room.players.get(voter);
-      if (target === a.author) {
-        if (v) v.score += 1;
-        room.roundPoints.set(voter, (room.roundPoints.get(voter) || 0) + 1);
-      } else {
-        const author = room.players.get(a.author);
-        if (author) author.score += 1;
-        room.roundPoints.set(a.author, (room.roundPoints.get(a.author) || 0) + 1);
+  const r = room.r;
+  r.idx++;
+  if (r.idx < r.items.length) return setPhase(room, "guess", room.settings.guessTime, endGuess);
+  finishRound(room);
+}
+
+function endVote(room) {
+  finishRound(room);
+}
+
+// --- calcul des résultats d'une manche ---
+function finishRound(room) {
+  const r = room.r;
+  const P = (id) => room.players.get(id);
+  let rv = {};
+
+  switch (r.type) {
+    case "anecdote":
+    case "menteur": {
+      rv.items = r.items.map((it) => {
+        const votes = [];
+        for (const [voter, v] of it.votes) {
+          const ok = r.type === "anecdote" ? v.t === it.author : v.t === it.lie;
+          if (ok) {
+            addScore(room, voter, v.dbl ? 2 : 1);
+            stat(P(voter), "found");
+          } else {
+            if (v.dbl) addScore(room, voter, -1);
+            addScore(room, it.author, 1);
+            stat(P(it.author), "fooled");
+          }
+          votes.push({ voter, target: v.t, dbl: !!v.dbl, ok });
+        }
+        if (r.type === "anecdote") room.recap.push(`📝 « ${it.text} » — ${nameOf(room, it.author)}`);
+        else room.recap.push(`🤥 ${nameOf(room, it.author)} : le mensonge était « ${it.statements[it.lie]} »`);
+        return { author: it.author, text: it.text, statements: it.statements, lie: it.lie, votes };
+      });
+      break;
+    }
+    case "phrase": {
+      const tally = {};
+      for (const [voter, itemId] of r.votes) (tally[itemId] ||= []).push(voter);
+      rv.items = r.items
+        .map((it) => ({ author: it.author, text: it.text, voters: tally[it.id] || [] }))
+        .sort((a, b) => b.voters.length - a.voters.length);
+      for (const it of rv.items) {
+        if (it.voters.length) {
+          addScore(room, it.author, it.voters.length);
+          stat(P(it.author), "funny", it.voters.length);
+        }
       }
+      if (rv.items[0]?.voters.length) room.recap.push(`😂 « ${r.question} » ${rv.items[0].text} — ${nameOf(room, rv.items[0].author)}`);
+      break;
+    }
+    case "qui": {
+      const tally = {};
+      for (const [voter, target] of r.votes) (tally[target] ||= []).push(voter);
+      rv.tally = tally;
+      const max = Math.max(0, ...Object.values(tally).map((v) => v.length));
+      const winners = Object.keys(tally).filter((k) => tally[k].length === max && max > 0);
+      for (const [target, voters] of Object.entries(tally)) stat(P(target), "balance", voters.length);
+      room.history.push({ question: r.question, winners });
+      if (winners.length) room.recap.push(`👉 ${r.question} ${winners.map((w) => nameOf(room, w)).join(", ")}`);
+      break;
+    }
+    case "ouinon": {
+      let oui = 0, non = 0;
+      for (const [, t] of r.votes) t === "oui" ? oui++ : non++;
+      rv.counts = { oui, non };
+      rv.preds = [];
+      for (const [pid, n] of r.preds) {
+        const diff = Math.abs(n - oui);
+        const pts = diff === 0 ? 2 : diff === 1 ? 1 : 0;
+        if (pts) addScore(room, pid, pts);
+        if (diff === 0) stat(P(pid), "voyant");
+        rv.preds.push({ pid, n, pts });
+      }
+      room.recap.push(`✅ ${r.question} → ${oui} oui / ${non} non`);
+      break;
+    }
+    case "tuprefs": {
+      rv.choices = { 0: [], 1: [] };
+      for (const [pid, c] of r.votes) rv.choices[c].push(pid);
+      room.recap.push(`🤔 ${r.opts[0]} (${rv.choices[0].length}) VS ${r.opts[1]} (${rv.choices[1].length})`);
+      break;
+    }
+    case "jamais": {
+      rv.did = [];
+      rv.never = [];
+      for (const [pid, c] of r.votes) {
+        if (c === "did") {
+          rv.did.push(pid);
+          stat(P(pid), "jamais");
+        } else rv.never.push(pid);
+      }
+      room.recap.push(`🍺 ${r.question} → déjà fait : ${rv.did.map((id) => nameOf(room, id)).join(", ") || "personne"}`);
+      break;
+    }
+    case "connais": {
+      const answer = r.votes.get(r.target);
+      rv.answer = answer ?? null;
+      rv.guesses = [];
+      for (const [pid, c] of r.votes) {
+        if (pid === r.target) continue;
+        const ok = answer != null && c === answer;
+        if (ok) {
+          addScore(room, pid, 1);
+          stat(P(pid), "connais");
+        }
+        rv.guesses.push({ pid, choice: c, ok });
+      }
+      if (answer != null) room.recap.push(`🧠 ${nameOf(room, r.target)} préfère : ${r.opts[answer]}`);
+      break;
     }
   }
-  setPhase(room, "anecReveal");
+  rv.points = r.points;
+  r.reveal = rv;
+  setPhase(room, "reveal");
 }
 
-// --- votes (qui / ouinon) ---
-function endVote(room) {
-  if (room.phase !== "vote") return;
-  const round = currentRound(room);
-  if (round.type === "qui") {
-    const tally = {};
-    for (const [, target] of room.votes) tally[target] = (tally[target] || 0) + 1;
-    let best = 0;
-    for (const n of Object.values(tally)) best = Math.max(best, n);
-    const winners = Object.keys(tally).filter((k) => tally[k] === best && best > 0);
-    room.history.push({ type: "qui", question: round.question, winners });
+// --- fin de partie ---
+const TITLES = [
+  { key: "found", emoji: "🕵️", title: "Le détective" },
+  { key: "fooled", emoji: "🤥", title: "Le plus gros menteur" },
+  { key: "balance", emoji: "🎯", title: "Le plus balancé" },
+  { key: "funny", emoji: "😂", title: "Le plus drôle" },
+  { key: "jamais", emoji: "🍺", title: "Le plus expérimenté" },
+  { key: "voyant", emoji: "🔮", title: "Le voyant" },
+  { key: "connais", emoji: "🧠", title: "Connaît tout le monde par cœur" },
+];
+
+function endGame(room) {
+  const players = [...room.players.values()];
+  const titles = [];
+  for (const t of TITLES) {
+    const max = Math.max(0, ...players.map((p) => p.stats[t.key] || 0));
+    if (max > 0) titles.push({ ...t, ids: players.filter((p) => (p.stats[t.key] || 0) === max).map((p) => p.id), value: max });
   }
-  setPhase(room, "voteReveal");
+  room.endTitles = titles;
+  room.gage = null;
+  if (room.settings.gages && players.length >= 2) {
+    const min = Math.min(...players.map((p) => p.score));
+    const loser = pick(players.filter((p) => p.score === min));
+    const hot = room.settings.packs.includes("hot");
+    room.gage = { pid: loser.id, text: pick(hot && Math.random() < 0.6 ? GAGES.hot : GAGES.normal) };
+  }
+  setPhase(room, "end");
 }
 
-function currentRound(room) {
-  return room.rounds[room.roundIndex];
+// --- tout le monde a répondu ? ---
+function expected(room) {
+  const ids = connected(room).map((p) => p.id);
+  if (room.phase === "guess") {
+    const it = room.r.items[room.r.idx];
+    return ids.filter((id) => id !== it.author);
+  }
+  return ids;
 }
-
+function acted(room) {
+  if (room.phase === "write") return room.r.subs;
+  if (room.phase === "guess") return room.r.items[room.r.idx].votes;
+  return room.r.votes;
+}
 function checkAllDone(room) {
-  const active = connected(room).map((p) => p.id);
-  if (!active.length) return;
-  let done = false;
-  if (room.phase === "write") done = active.every((id) => room.submissions.has(id));
-  else if (room.phase === "guess") {
-    const a = room.anecdotes[room.guessIndex];
-    done = active.filter((id) => id !== a.author).every((id) => a.votes.has(id));
-  } else if (room.phase === "vote") done = active.every((id) => room.votes.has(id));
-  if (done) {
-    const phase = room.phase;
-    const marker = `${room.roundIndex}:${room.guessIndex}:${phase}`;
-    clearTimer(room);
-    room.deadline = Date.now() + REVEAL_PAUSE;
-    room.duration = REVEAL_PAUSE / 1000;
-    broadcast(room);
-    room.timer = setTimeout(() => {
-      if (`${room.roundIndex}:${room.guessIndex}:${room.phase}` !== marker) return;
-      if (phase === "write") endWrite(room);
-      else if (phase === "guess") endGuess(room);
-      else endVote(room);
-    }, REVEAL_PAUSE);
-  }
+  if (!["write", "guess", "vote"].includes(room.phase)) return;
+  const exp = expected(room);
+  if (!exp.length) return;
+  const a = acted(room);
+  if (!exp.every((id) => a.has(id))) return;
+  const phase = room.phase;
+  const fn = phase === "write" ? endWrite : phase === "guess" ? endGuess : endVote;
+  clearTimer(room);
+  const id = rid();
+  room.phaseId = id;
+  room.deadline = Date.now() + DONE_PAUSE;
+  room.duration = DONE_PAUSE / 1000;
+  broadcast(room);
+  room.timer = setTimeout(() => room.phaseId === id && fn(room), DONE_PAUSE);
 }
 
 // ---------- actions des joueurs ----------
 function handleAction(room, player, body) {
   const isHost = room.hostId === player.id;
-  const round = room.rounds?.[room.roundIndex];
+  const r = room.r;
 
   switch (body.type) {
     case "settings": {
       if (!isHost || room.phase !== "lobby") return "Seul l'hôte peut modifier les réglages.";
       const s = body.settings || {};
-      const splitLines = (txt) =>
-        String(txt || "")
-          .split("\n")
-          .map((l) => cleanText(l, 200))
-          .filter(Boolean)
-          .slice(0, 50);
+      const cur = room.settings;
+      const lines = (txt) => String(txt || "").split("\n").map((l) => cleanText(l, 200)).filter(Boolean).slice(0, 50);
+      const rounds = {};
+      for (const t of TYPES) rounds[t] = clampInt(s.rounds?.[t], 0, 10, cur.rounds[t]);
+      const packs = Array.isArray(s.packs) ? s.packs.filter((p) => PACKS[p]) : cur.packs;
+      const custom = {};
+      for (const k of Object.keys(DEFAULT_SETTINGS.custom)) custom[k] = s.custom ? lines(s.custom[k]) : cur.custom[k];
       room.settings = {
-        anecdoteRounds: clampInt(s.anecdoteRounds, 0, 10, room.settings.anecdoteRounds),
-        quiRounds: clampInt(s.quiRounds, 0, 15, room.settings.quiRounds),
-        ouinonRounds: clampInt(s.ouinonRounds, 0, 15, room.settings.ouinonRounds),
-        writeTime: clampInt(s.writeTime, 20, 300, room.settings.writeTime),
-        guessTime: clampInt(s.guessTime, 10, 120, room.settings.guessTime),
-        voteTime: clampInt(s.voteTime, 10, 120, room.settings.voteTime),
-        mode: ["normal", "hot", "mix"].includes(s.mode) ? s.mode : room.settings.mode,
-        custom: s.custom
-          ? { anecdote: splitLines(s.custom.anecdote), qui: splitLines(s.custom.qui), ouinon: splitLines(s.custom.ouinon) }
-          : room.settings.custom,
+        rounds,
+        writeTime: clampInt(s.writeTime, 20, 300, cur.writeTime),
+        guessTime: clampInt(s.guessTime, 10, 120, cur.guessTime),
+        voteTime: clampInt(s.voteTime, 10, 120, cur.voteTime),
+        packs: packs.length ? packs : ["normal"],
+        gages: typeof s.gages === "boolean" ? s.gages : cur.gages,
+        custom,
       };
       broadcast(room);
       return null;
@@ -276,60 +448,93 @@ function handleAction(room, player, body) {
       if (!isHost) return "Seul l'hôte peut lancer la partie.";
       if (room.phase !== "lobby" && room.phase !== "end") return "Partie déjà en cours.";
       if (connected(room).length < MIN_PLAYERS) return `Il faut au moins ${MIN_PLAYERS} joueurs connectés.`;
-      const s = room.settings;
-      if (s.anecdoteRounds + s.quiRounds + s.ouinonRounds === 0) return "Ajoute au moins une manche.";
+      if (!TYPES.some((t) => room.settings.rounds[t] > 0)) return "Ajoute au moins une manche.";
       startGame(room);
       return null;
     }
     case "lobby": {
       if (!isHost || room.phase !== "end") return null;
-      clearTimer(room);
-      room.phase = "lobby";
-      room.deadline = null;
-      room.duration = 0;
-      broadcast(room);
+      setPhase(room, "lobby");
       return null;
     }
     case "submit": {
       if (room.phase !== "write") return null;
-      const text = cleanText(body.text, MAX_ANECDOTE);
-      if (!text) return "Ton anecdote est vide.";
-      room.submissions.set(player.id, text);
+      if (r.type === "menteur") {
+        const st = Array.isArray(body.statements) ? body.statements.slice(0, 3).map((x) => cleanText(x, MAX_STATEMENT)) : [];
+        const lie = clampInt(body.lie, 0, 2, -1);
+        if (st.length !== 3 || st.some((x) => !x)) return "Écris tes 3 phrases.";
+        if (lie < 0) return "Choisis laquelle est le mensonge.";
+        r.subs.set(player.id, { s: st, lie });
+      } else {
+        const text = cleanText(body.text, MAX_TEXT);
+        if (!text) return "Ta réponse est vide.";
+        r.subs.set(player.id, text);
+      }
       broadcast(room);
       checkAllDone(room);
       return null;
     }
     case "guess": {
       if (room.phase !== "guess") return null;
-      const a = room.anecdotes[room.guessIndex];
-      if (!a || a.id !== body.anecdoteId) return null;
-      if (a.author === player.id) return "C'est ton anecdote, chut 🤫";
-      if (!room.players.has(body.target)) return null;
-      a.votes.set(player.id, body.target);
+      const it = r.items[r.idx];
+      if (!it || it.id !== body.itemId) return null;
+      if (it.author === player.id) return "C'est la tienne, chut 🤫";
+      let t;
+      if (r.type === "anecdote") {
+        if (!room.players.has(body.target)) return null;
+        t = body.target;
+      } else {
+        t = clampInt(body.target, 0, 2, -1);
+        if (t < 0) return null;
+      }
+      it.votes.set(player.id, { t, dbl: !!body.dbl });
       broadcast(room);
       checkAllDone(room);
       return null;
     }
     case "vote": {
-      if (room.phase !== "vote" || !round) return null;
-      if (round.type === "qui") {
-        if (!room.players.has(body.target)) return null;
-        room.votes.set(player.id, body.target);
-      } else {
-        if (body.target !== "oui" && body.target !== "non") return null;
-        room.votes.set(player.id, body.target);
+      if (room.phase !== "vote" || !r) return null;
+      const t = body.target;
+      switch (r.type) {
+        case "qui":
+          if (!room.players.has(t)) return null;
+          break;
+        case "ouinon":
+          if (t !== "oui" && t !== "non") return null;
+          break;
+        case "tuprefs":
+        case "connais":
+          if (t !== 0 && t !== 1) return null;
+          break;
+        case "jamais":
+          if (t !== "did" && t !== "never") return null;
+          break;
+        case "phrase": {
+          const it = r.items.find((x) => x.id === t);
+          if (!it) return null;
+          if (it.author === player.id) return "Tu ne peux pas voter pour ta propre réponse 😏";
+          break;
+        }
+        default:
+          return null;
       }
+      r.votes.set(player.id, t);
       broadcast(room);
       checkAllDone(room);
       return null;
     }
+    case "predict": {
+      if (room.phase !== "vote" || r.type !== "ouinon") return null;
+      r.preds.set(player.id, clampInt(body.n, 0, MAX_PLAYERS, 0));
+      broadcast(room);
+      return null;
+    }
     case "next": {
       if (!isHost) return null;
-      if (room.phase === "anecReveal" || room.phase === "voteReveal") nextRound(room);
+      if (room.phase === "reveal") nextRound(room);
       return null;
     }
     case "skip": {
-      // l'hôte peut couper le timer en cours
       if (!isHost) return null;
       if (room.phase === "write") endWrite(room);
       else if (room.phase === "guess") endGuess(room);
@@ -349,100 +554,135 @@ function handleAction(room, player, body) {
       checkAllDone(room);
       return null;
     }
+    case "joker": {
+      if (room.phase !== "reveal" && room.phase !== "end") return "Le joker s'utilise pendant les révélations.";
+      if (player.jokerUsed) return "Tu as déjà utilisé ton joker 🃏";
+      if (!room.players.has(body.target) || body.target === player.id) return null;
+      player.jokerUsed = true;
+      emitAll(room, { type: "joker", from: player.id, target: body.target });
+      broadcast(room);
+      return null;
+    }
     default:
       return "Action inconnue.";
   }
 }
 
-// ---------- vue envoyée à chaque joueur ----------
-function publicPlayer(p) {
-  return { id: p.id, name: p.name, avatar: p.avatar, color: p.color, score: p.score, connected: p.clients.size > 0 };
+// réactions emoji : joueurs et spectateurs
+function handleReact(room, viewer, emoji) {
+  if (!REACTIONS.includes(emoji)) return;
+  const now = Date.now();
+  viewer.reacts = (viewer.reacts || []).filter((t) => now - t < 2000);
+  if (viewer.reacts.length >= 6) return;
+  viewer.reacts.push(now);
+  emitAll(room, { type: "react", emoji, from: viewer.id });
 }
 
-function viewFor(room, me) {
-  const round = room.rounds?.[room.roundIndex];
+// ---------- vue envoyée à chaque joueur ----------
+function publicPlayer(room, p) {
+  return {
+    id: p.id,
+    name: p.name,
+    avatar: p.avatar,
+    color: p.color,
+    photo: p.photo ? `/avatar/${room.code}/${p.id}?v=${p.photoV}` : null,
+    score: p.score,
+    connected: p.clients.size > 0,
+    jokerUsed: p.jokerUsed,
+  };
+}
+
+function viewFor(room, viewer, spectator = false) {
+  const r = room.r;
+  const me = viewer.id;
   const v = {
     code: room.code,
-    me: me.id,
+    me,
+    spectator,
     hostId: room.hostId,
-    players: [...room.players.values()].sort((a, b) => a.joinedAt - b.joinedAt).map(publicPlayer),
+    players: [...room.players.values()].sort((a, b) => a.joinedAt - b.joinedAt).map((p) => publicPlayer(room, p)),
+    spectators: [...room.spectators.values()].filter((s) => s.clients.size).map((s) => ({ id: s.id, name: s.name })),
     phase: room.phase,
     settings: room.settings,
+    packsInfo: Object.fromEntries(Object.entries(PACKS).map(([k, p]) => [k, { label: p.label, emoji: p.emoji, hot: !!p.hot }])),
     deadline: room.deadline,
     duration: room.duration || 0,
     now: Date.now(),
     roundNum: room.roundIndex + 1,
     totalRounds: room.rounds?.length || 0,
-    round: round ? { type: round.type, question: round.question, hot: !!round.hot } : null,
+    round: r && room.phase !== "lobby" && room.phase !== "end" ? { type: r.type, question: r.question, opts: r.opts, hot: !!r.hot, target: r.target } : null,
     minPlayers: MIN_PLAYERS,
-    maxAnecdote: MAX_ANECDOTE,
+    maxText: MAX_TEXT,
+    maxStatement: MAX_STATEMENT,
+    reactions: REACTIONS,
   };
 
   switch (room.phase) {
     case "write":
-      v.done = [...room.submissions.keys()];
-      v.myText = room.submissions.get(me.id) || "";
+      v.done = [...r.subs.keys()];
+      v.mySub = r.subs.get(me) || null;
       break;
     case "guess": {
-      const a = room.anecdotes[room.guessIndex];
-      v.anecdote = { id: a.id, text: a.text, index: room.guessIndex + 1, total: room.anecdotes.length };
-      v.isMine = a.author === me.id;
-      v.myVote = a.votes.get(me.id) || null;
-      v.done = [...a.votes.keys()];
-      v.waitingFor = connected(room).map((p) => p.id).filter((id) => id !== a.author);
+      const it = r.items[r.idx];
+      v.item = { id: it.id, index: r.idx + 1, total: r.items.length };
+      if (r.type === "anecdote") v.item.text = it.text;
+      else {
+        v.item.author = it.author;
+        v.item.statements = it.statements;
+      }
+      v.isMine = it.author === me;
+      const mv = it.votes.get(me);
+      v.myVote = mv ? mv.t : null;
+      v.myDbl = mv ? mv.dbl : false;
+      v.done = [...it.votes.keys()];
+      v.expected = expected(room).length;
       break;
     }
-    case "anecReveal":
-      v.anecdotes = room.anecdotes.map((a) => ({
-        text: a.text,
-        author: a.author,
-        votes: [...a.votes.entries()].map(([voter, target]) => ({ voter, target })),
-      }));
-      v.roundPoints = Object.fromEntries(room.roundPoints);
-      break;
     case "vote":
-      v.myVote = room.votes.get(me.id) || null;
-      v.done = [...room.votes.keys()];
-      break;
-    case "voteReveal":
-      if (round.type === "qui") {
-        const tally = {};
-        for (const [voter, target] of room.votes) (tally[target] ||= []).push(voter);
-        v.tally = tally; // qui a voté pour qui : visible
-      } else {
-        let oui = 0, non = 0;
-        for (const [, t] of room.votes) t === "oui" ? oui++ : non++;
-        v.counts = { oui, non }; // anonyme : seulement les totaux
+      v.myVote = r.votes.has(me) ? r.votes.get(me) : null;
+      v.done = [...r.votes.keys()];
+      v.expected = expected(room).length;
+      if (r.type === "phrase") {
+        v.answers = r.items.map((it) => ({ id: it.id, text: it.text, mine: it.author === me }));
       }
+      if (r.type === "ouinon") v.myPred = r.preds.has(me) ? r.preds.get(me) : null;
       break;
-    case "end": {
-      // Titres de fin : qui a été le plus désigné dans les "qui est le plus…"
-      const titles = {};
-      for (const h of room.history || []) {
-        if (h.type !== "qui") continue;
-        for (const w of h.winners) (titles[w] ||= []).push(h.question);
-      }
-      v.titles = titles;
+    case "reveal":
+      v.reveal = r.reveal;
       break;
-    }
+    case "end":
+      v.titles = room.endTitles;
+      v.quiTitles = {};
+      for (const h of room.history || []) for (const w of h.winners) (v.quiTitles[w] ||= []).push(h.question);
+      v.gage = room.gage;
+      v.recap = room.recap;
+      break;
   }
   return v;
 }
 
 // ---------- SSE ----------
-function sendEvent(res, data) {
+function sendEvent(res, data, event) {
   try {
-    res.write(`data: ${JSON.stringify(data)}\n\n`);
+    res.write((event ? `event: ${event}\n` : "") + `data: ${JSON.stringify(data)}\n\n`);
   } catch {}
+}
+
+function viewers(room) {
+  return [...[...room.players.values()].map((p) => [p, false]), ...[...room.spectators.values()].map((s) => [s, true])];
 }
 
 function broadcast(room) {
   room.lastActive = Date.now();
-  for (const p of room.players.values()) {
-    if (!p.clients.size) continue;
-    const view = viewFor(room, p);
-    for (const res of p.clients) sendEvent(res, view);
+  for (const [vw, spec] of viewers(room)) {
+    if (!vw.clients.size) continue;
+    const view = viewFor(room, vw, spec);
+    for (const res of vw.clients) sendEvent(res, view);
   }
+}
+
+function emitAll(room, data) {
+  for (const [vw] of viewers(room)) for (const res of vw.clients) sendEvent(res, data, "fx");
 }
 
 function ensureHost(room) {
@@ -458,12 +698,12 @@ function json(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-function readBody(req) {
+function readBody(req, limit = 20000) {
   return new Promise((resolve) => {
     let data = "";
     req.on("data", (c) => {
       data += c;
-      if (data.length > 20000) req.destroy();
+      if (data.length > limit) req.destroy();
     });
     req.on("end", () => {
       try {
@@ -478,22 +718,28 @@ function readBody(req) {
 const MIME = { ".html": "text/html; charset=utf-8", ".js": "text/javascript", ".css": "text/css", ".png": "image/png", ".svg": "image/svg+xml", ".ico": "image/x-icon" };
 
 function serveStatic(req, res, pathname) {
-  let file = pathname === "/" ? "/index.html" : pathname;
+  const file = pathname === "/" ? "/index.html" : pathname;
   const full = path.normalize(path.join(PUBLIC_DIR, file));
   if (!full.startsWith(PUBLIC_DIR)) return json(res, 403, { error: "forbidden" });
   fs.readFile(full, (err, buf) => {
     if (err) {
       // toutes les URLs inconnues (ex: /ABCD) renvoient le jeu
-      fs.readFile(path.join(PUBLIC_DIR, "index.html"), (e2, idx) => {
+      return fs.readFile(path.join(PUBLIC_DIR, "index.html"), (e2, idx) => {
         if (e2) return json(res, 404, { error: "not found" });
         res.writeHead(200, { "Content-Type": MIME[".html"] });
         res.end(idx);
       });
-      return;
     }
     res.writeHead(200, { "Content-Type": MIME[path.extname(full)] || "application/octet-stream" });
     res.end(buf);
   });
+}
+
+function findViewer(room, id) {
+  if (!room) return null;
+  if (room.players.has(id)) return { v: room.players.get(id), spec: false };
+  if (room.spectators.has(id)) return { v: room.spectators.get(id), spec: true };
+  return null;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -501,34 +747,40 @@ const server = http.createServer(async (req, res) => {
   const p = url.pathname;
 
   if (req.method === "POST" && p === "/api/create") {
-    const b = await readBody(req);
+    const b = await readBody(req, 80000);
     const code = newRoomCode();
-    const host = makePlayer(b.name, b.avatar, b.color);
-    const room = {
+    const host = makePlayer(b);
+    rooms.set(code, {
       code,
       hostId: host.id,
       players: new Map([[host.id, host]]),
+      spectators: new Map(),
       phase: "lobby",
       settings: structuredClone(DEFAULT_SETTINGS),
-      usedQuestions: new Set(),
+      used: new Set(),
       roundIndex: -1,
       rounds: [],
+      r: null,
       lastActive: Date.now(),
-    };
-    rooms.set(code, room);
+    });
     return json(res, 200, { code, pid: host.id });
   }
 
   if (req.method === "POST" && p === "/api/join") {
-    const b = await readBody(req);
+    const b = await readBody(req, 80000);
     const room = rooms.get(String(b.code || "").toUpperCase().trim());
     if (!room) return json(res, 404, { error: "Cette salle n'existe pas." });
-    if (room.phase !== "lobby") return json(res, 409, { error: "La partie a déjà commencé, attends la fin !" });
-    if (room.players.size >= MAX_PLAYERS) return json(res, 409, { error: "La salle est pleine." });
     const name = cleanText(b.name, 16);
+    if (b.spectate) {
+      if (room.spectators.size >= MAX_SPECTATORS) return json(res, 409, { error: "Trop de spectateurs." });
+      const s = { id: rid(), name: name || "Spectateur", clients: new Set(), reacts: [] };
+      room.spectators.set(s.id, s);
+      return json(res, 200, { code: room.code, pid: s.id, spectator: true });
+    }
+    if (room.players.size >= MAX_PLAYERS) return json(res, 409, { error: "La salle est pleine (tu peux rejoindre en spectateur)." });
     if ([...room.players.values()].some((pl) => pl.name.toLowerCase() === name.toLowerCase()))
       return json(res, 409, { error: "Ce pseudo est déjà pris dans la salle." });
-    const player = makePlayer(name, b.avatar, b.color);
+    const player = makePlayer(b);
     room.players.set(player.id, player);
     broadcast(room);
     return json(res, 200, { code: room.code, pid: player.id });
@@ -537,16 +789,30 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && p === "/api/action") {
     const b = await readBody(req);
     const room = rooms.get(String(b.code || "").toUpperCase());
-    const player = room?.players.get(b.pid);
-    if (!room || !player) return json(res, 404, { error: "Session expirée." });
-    const err = handleAction(room, player, b);
+    const found = findViewer(room, b.pid);
+    if (!found) return json(res, 404, { error: "Session expirée." });
+    if (b.type === "react") {
+      handleReact(room, found.v, b.emoji);
+      return json(res, 200, { ok: true });
+    }
+    if (found.spec) return json(res, 403, { error: "Les spectateurs ne peuvent pas jouer 👀" });
+    const err = handleAction(room, found.v, b);
     return json(res, err ? 400 : 200, err ? { error: err } : { ok: true });
+  }
+
+  if (req.method === "GET" && p.startsWith("/avatar/")) {
+    const [, , code, pid] = p.split("/");
+    const pl = rooms.get(code)?.players.get(pid);
+    if (!pl?.photo) return json(res, 404, { error: "no photo" });
+    res.writeHead(200, { "Content-Type": pl.photo.type, "Cache-Control": "public, max-age=86400" });
+    return res.end(pl.photo.buf);
   }
 
   if (req.method === "GET" && p === "/events") {
     const room = rooms.get(String(url.searchParams.get("code") || "").toUpperCase());
-    const player = room?.players.get(url.searchParams.get("pid"));
-    if (!room || !player) return json(res, 404, { error: "Session expirée." });
+    const found = findViewer(room, url.searchParams.get("pid"));
+    if (!found) return json(res, 404, { error: "Session expirée." });
+    const vw = found.v;
     res.writeHead(200, {
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
@@ -554,11 +820,12 @@ const server = http.createServer(async (req, res) => {
       "X-Accel-Buffering": "no",
     });
     res.write("retry: 2000\n\n");
-    player.clients.add(res);
+    vw.clients.add(res);
     ensureHost(room);
     broadcast(room);
     req.on("close", () => {
-      player.clients.delete(res);
+      vw.clients.delete(res);
+      broadcast(room);
       // si l'hôte part, on attend un peu avant de passer le rôle à quelqu'un d'autre
       setTimeout(() => {
         if (!rooms.has(room.code)) return;
@@ -566,14 +833,13 @@ const server = http.createServer(async (req, res) => {
         broadcast(room);
         checkAllDone(room);
       }, 8000);
-      broadcast(room);
     });
     return;
   }
 
   if (req.method === "GET" && p === "/api/check") {
     const room = rooms.get(String(url.searchParams.get("code") || "").toUpperCase());
-    const ok = !!room?.players.get(url.searchParams.get("pid"));
+    const ok = !!findViewer(room, url.searchParams.get("pid"));
     return json(res, ok ? 200 : 404, { ok });
   }
 
@@ -587,10 +853,14 @@ const server = http.createServer(async (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [code, room] of rooms) {
-    for (const pl of room.players.values()) for (const res of pl.clients) {
-      try { res.write(": ping\n\n"); } catch {}
-    }
-    if (connected(room).length === 0 && now - room.lastActive > 30 * 60 * 1000) {
+    for (const [vw] of viewers(room))
+      for (const res of vw.clients) {
+        try {
+          res.write(": ping\n\n");
+        } catch {}
+      }
+    const anyone = viewers(room).some(([vw]) => vw.clients.size);
+    if (!anyone && now - room.lastActive > 30 * 60 * 1000) {
       clearTimer(room);
       rooms.delete(code);
     }
